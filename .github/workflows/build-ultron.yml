@@ -61,7 +61,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          unzip -q ULTRON-0.4.9-Multi-AI-Animated-Voice-Fix-Source.zip
+          unzip -q ULTRON-0.6.0-Agent-Core-Upgrade-Source.zip
           test -f ultron_final_work/app/build.gradle.kts
           test -f ultron_final_work/settings.gradle.kts
 
