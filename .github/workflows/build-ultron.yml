@@ -1,4 +1,4 @@
-name: Build ULTRON 1.5.2 APK
+name: Build ULTRON APK
 
 on:
   push:
@@ -11,12 +11,12 @@ permissions:
   contents: read
 
 concurrency:
-  group: ultron-1.5.2-${{ github.ref }}
+  group: ultron-android-${{ github.ref }}
   cancel-in-progress: true
 
 jobs:
   build:
-    name: Extract, test and build ULTRON 1.5.2
+    name: Extract, test and build ULTRON
     runs-on: ubuntu-24.04
     timeout-minutes: 90
 
@@ -37,47 +37,51 @@ jobs:
       - name: Set up Android SDK
         uses: android-actions/setup-android@v4
 
-      - name: Locate and extract ULTRON 1.5.2 source ZIP
+      - name: Locate, validate and extract ULTRON source ZIP
         shell: bash
         run: |
           set -euo pipefail
 
-          # Prefer the exact archive name. If it was uploaded with a slightly
-          # different name, accept one unambiguous ULTRON 1.5.2 ZIP in the repo root.
+          # Keep accepting the repository filename used by this project.
+          # The archive's internal app version is read separately below.
           SOURCE_ZIP="ULTRON-1.5.2-FINAL-SOURCE.zip"
           if [[ ! -f "$SOURCE_ZIP" ]]; then
-            mapfile -t CANDIDATES < <(find . -maxdepth 1 -type f -iname 'ULTRON-1.5.2*.zip' -print)
+            mapfile -t CANDIDATES < <(find . -maxdepth 1 -type f \
+              \( -iname 'ULTRON-1.5.2*.zip' -o -iname 'ULTRON-1.5.3*.zip' \) -print | sort)
             if [[ "${#CANDIDATES[@]}" -ne 1 ]]; then
-              echo "Expected $SOURCE_ZIP or exactly one ULTRON-1.5.2*.zip in the repository root."
+              echo "Expected $SOURCE_ZIP or exactly one ULTRON 1.5.2/1.5.3 source ZIP in the repository root."
               echo "ZIP files found:"
-              find . -maxdepth 1 -type f -name '*.zip' -print
+              find . -maxdepth 1 -type f -iname '*.zip' -print | sort || true
               exit 1
             fi
             SOURCE_ZIP="${CANDIDATES[0]}"
           fi
 
           echo "Using source archive: $SOURCE_ZIP"
-          PROJECT_DIR="$RUNNER_TEMP/ultron-1.5.2-source"
+          unzip -t "$SOURCE_ZIP"
+
+          PROJECT_DIR="$RUNNER_TEMP/ultron-source"
           rm -rf "$PROJECT_DIR"
           mkdir -p "$PROJECT_DIR"
           unzip -q "$SOURCE_ZIP" -d "$PROJECT_DIR"
 
-          # This archive contains the Gradle project directly at its ZIP root.
-          # Keep a fallback for a future archive that adds one enclosing folder.
-          if [[ ! -f "$PROJECT_DIR/settings.gradle.kts" ]]; then
-            mapfile -t SETTINGS_FILES < <(find "$PROJECT_DIR" -mindepth 2 -maxdepth 3 -type f -name settings.gradle.kts -print)
+          # Project files may be at the ZIP root or inside one enclosing folder.
+          if [[ ! -f "$PROJECT_DIR/settings.gradle.kts" && ! -f "$PROJECT_DIR/settings.gradle" ]]; then
+            mapfile -t SETTINGS_FILES < <(find "$PROJECT_DIR" -mindepth 2 -maxdepth 4 \
+              -type f \( -name settings.gradle.kts -o -name settings.gradle \) -print)
             if [[ "${#SETTINGS_FILES[@]}" -ne 1 ]]; then
-              echo "Could not identify one Android project root after extraction."
-              find "$PROJECT_DIR" -maxdepth 3 -type f \( -name settings.gradle.kts -o -name app.gradle.kts \) -print
+              echo "Could not identify exactly one Gradle project root after extraction."
+              find "$PROJECT_DIR" -maxdepth 4 -type f \
+                \( -name settings.gradle.kts -o -name settings.gradle -o -name build.gradle.kts \) -print
               exit 1
             fi
             PROJECT_DIR="$(dirname "${SETTINGS_FILES[0]}")"
           fi
 
-          test -f "$PROJECT_DIR/settings.gradle.kts"
-          test -f "$PROJECT_DIR/build.gradle.kts"
-          test -f "$PROJECT_DIR/app/build.gradle.kts"
-          test -f "$PROJECT_DIR/app/src/main/cpp/CMakeLists.txt"
+          test -f "$PROJECT_DIR/settings.gradle.kts" || test -f "$PROJECT_DIR/settings.gradle"
+          test -f "$PROJECT_DIR/build.gradle.kts" || test -f "$PROJECT_DIR/build.gradle"
+          test -f "$PROJECT_DIR/app/build.gradle.kts" || test -f "$PROJECT_DIR/app/build.gradle"
+
           echo "ULTRON_PROJECT_DIR=$PROJECT_DIR" >> "$GITHUB_ENV"
           echo "Extracted project root: $PROJECT_DIR"
 
@@ -86,7 +90,8 @@ jobs:
         run: |
           set -euo pipefail
 
-          # Accept SDK licenses non-interactively before installing packages.
+          # Accept licenses non-interactively; the pipe may close early after all
+          # licenses are accepted, so intentionally tolerate its SIGPIPE status.
           yes | sdkmanager --licenses >/dev/null 2>&1 || true
 
           for attempt in 1 2 3; do
@@ -114,23 +119,41 @@ jobs:
         with:
           gradle-version: '8.9'
 
-      - name: Verify extracted ULTRON project configuration
+      - name: Verify Gradle configuration and detect app version
         shell: bash
         run: |
           set -euo pipefail
           cd "$ULTRON_PROJECT_DIR"
 
-          grep -Fq 'versionName = "1.5.2"' app/build.gradle.kts
-          grep -Fq 'compileSdk = 35' app/build.gradle.kts
-          grep -Fq 'ndkVersion = "27.2.12479018"' app/build.gradle.kts
-          grep -Fq 'version "8.7.3"' build.gradle.kts
-          grep -Fq 'version "2.0.21"' build.gradle.kts
+          APP_GRADLE="app/build.gradle.kts"
+          ROOT_GRADLE="build.gradle.kts"
+          test -f "$APP_GRADLE"
+          test -f "$ROOT_GRADLE"
 
+          # Do NOT hard-code 1.5.2 here: the uploaded ZIP may be named 1.5.2
+          # while its actual app version is 1.5.3 (or a later patch version).
+          APP_VERSION="$(sed -nE 's/^[[:space:]]*versionName[[:space:]]*=[[:space:]]*"([^"]+)".*/\1/p' "$APP_GRADLE" | head -n 1)"
+          if [[ -z "$APP_VERSION" ]]; then
+            echo "Could not read versionName from $APP_GRADLE"
+            exit 1
+          fi
+          if [[ ! "$APP_VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+([.-][A-Za-z0-9.-]+)?$ ]]; then
+            echo "Unexpected app versionName: $APP_VERSION"
+            exit 1
+          fi
+
+          grep -Fq 'compileSdk = 35' "$APP_GRADLE"
+          grep -Fq 'ndkVersion = "27.2.12479018"' "$APP_GRADLE"
+          grep -Fq 'version "8.7.3"' "$ROOT_GRADLE"
+          grep -Fq 'version "2.0.21"' "$ROOT_GRADLE"
+          test -f "app/src/main/cpp/CMakeLists.txt"
+
+          echo "ULTRON_APP_VERSION=$APP_VERSION" >> "$GITHUB_ENV"
+          echo "Detected ULTRON app version: $APP_VERSION"
           java -version
           gradle --version
-          echo "ULTRON 1.5.2 Gradle configuration verified."
 
-      - name: Run JVM unit tests (retry transient repository failures)
+      - name: Run JVM unit tests
         shell: bash
         run: |
           set -euo pipefail
@@ -150,7 +173,7 @@ jobs:
           echo "Unit tests failed after 3 attempts."
           exit 1
 
-      - name: Build ULTRON debug APK (retry transient repository failures)
+      - name: Build ULTRON debug APK
         shell: bash
         run: |
           set -euo pipefail
@@ -178,28 +201,47 @@ jobs:
 
           APK="app/build/outputs/apk/debug/app-debug.apk"
           test -s "$APK"
-          mkdir -p "$RUNNER_TEMP/ultron-build-output"
-          cp "$APK" "$RUNNER_TEMP/ultron-build-output/ULTRON-1.5.2-debug.apk"
-          cd "$RUNNER_TEMP/ultron-build-output"
-          sha256sum ULTRON-1.5.2-debug.apk | tee ULTRON-1.5.2-debug.apk.sha256
+          OUTPUT_DIR="$RUNNER_TEMP/ultron-build-output"
+          rm -rf "$OUTPUT_DIR"
+          mkdir -p "$OUTPUT_DIR"
+          cp "$APK" "$OUTPUT_DIR/ULTRON-${ULTRON_APP_VERSION}-debug.apk"
+          cd "$OUTPUT_DIR"
+          sha256sum "ULTRON-${ULTRON_APP_VERSION}-debug.apk" \
+            | tee "ULTRON-${ULTRON_APP_VERSION}-debug.apk.sha256"
           ls -lh
+
+      - name: Collect unit-test reports
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          REPORT_SOURCE="$ULTRON_PROJECT_DIR/app/build/reports/tests/testDebugUnitTest"
+          REPORT_OUTPUT="$RUNNER_TEMP/ultron-test-reports"
+          rm -rf "$REPORT_OUTPUT"
+          mkdir -p "$REPORT_OUTPUT"
+          if [[ -d "$REPORT_SOURCE" ]]; then
+            cp -a "$REPORT_SOURCE/." "$REPORT_OUTPUT/"
+            echo "Unit-test reports collected."
+          else
+            echo "No Gradle test report directory was produced."
+          fi
 
       - name: Upload unit-test reports
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: ULTRON-1.5.2-unit-test-reports
-          path: ${{ runner.temp }}/ultron-1.5.2-source/app/build/reports/tests/testDebugUnitTest/
+          name: ULTRON-${{ env.ULTRON_APP_VERSION || 'build' }}-unit-test-reports
+          path: ${{ runner.temp }}/ultron-test-reports/
           if-no-files-found: ignore
           retention-days: 14
 
-      - name: Upload ULTRON 1.5.2 debug APK and checksum
+      - name: Upload ULTRON debug APK and checksum
         if: success()
         uses: actions/upload-artifact@v4
         with:
-          name: ULTRON-1.5.2-debug-apk
+          name: ULTRON-${{ env.ULTRON_APP_VERSION }}-debug-apk
           path: |
-            ${{ runner.temp }}/ultron-build-output/ULTRON-1.5.2-debug.apk
-            ${{ runner.temp }}/ultron-build-output/ULTRON-1.5.2-debug.apk.sha256
+            ${{ runner.temp }}/ultron-build-output/ULTRON-${{ env.ULTRON_APP_VERSION }}-debug.apk
+            ${{ runner.temp }}/ultron-build-output/ULTRON-${{ env.ULTRON_APP_VERSION }}-debug.apk.sha256
           if-no-files-found: error
           retention-days: 30
