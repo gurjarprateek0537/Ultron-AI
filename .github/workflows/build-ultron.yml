@@ -1,82 +1,205 @@
-
-name: Build ULTRON APK
+name: Build ULTRON 1.5.2 APK
 
 on:
-  workflow_dispatch:
   push:
     branches:
       - main
+  pull_request:
+  workflow_dispatch:
 
 permissions:
   contents: read
 
+concurrency:
+  group: ultron-1.5.2-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   build:
+    name: Extract, test and build ULTRON 1.5.2
     runs-on: ubuntu-24.04
+    timeout-minutes: 90
+
     env:
       ANDROID_HOME: /usr/local/lib/android/sdk
       ANDROID_SDK_ROOT: /usr/local/lib/android/sdk
 
     steps:
-      - name: Checkout repository
+      - name: Check out repository
         uses: actions/checkout@v4
 
-      - name: Setup Java
+      - name: Set up JDK 17
         uses: actions/setup-java@v4
         with:
           distribution: temurin
-          java-version: "17"
+          java-version: '17'
 
-      - name: Locate Android SDK manager
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@v4
+
+      - name: Locate and extract ULTRON 1.5.2 source ZIP
         shell: bash
         run: |
           set -euo pipefail
-          SDKMANAGER="$(find "$ANDROID_HOME/cmdline-tools" -type f -name sdkmanager | sort -V | tail -n 1)"
-          if [ -z "$SDKMANAGER" ]; then
-            echo "Android sdkmanager was not found"
-            exit 1
+
+          # Prefer the exact archive name. If it was uploaded with a slightly
+          # different name, accept one unambiguous ULTRON 1.5.2 ZIP in the repo root.
+          SOURCE_ZIP="ULTRON-1.5.2-FINAL-SOURCE.zip"
+          if [[ ! -f "$SOURCE_ZIP" ]]; then
+            mapfile -t CANDIDATES < <(find . -maxdepth 1 -type f -iname 'ULTRON-1.5.2*.zip' -print)
+            if [[ "${#CANDIDATES[@]}" -ne 1 ]]; then
+              echo "Expected $SOURCE_ZIP or exactly one ULTRON-1.5.2*.zip in the repository root."
+              echo "ZIP files found:"
+              find . -maxdepth 1 -type f -name '*.zip' -print
+              exit 1
+            fi
+            SOURCE_ZIP="${CANDIDATES[0]}"
           fi
-          echo "SDKMANAGER=$SDKMANAGER" >> "$GITHUB_ENV"
-          echo "$(dirname "$SDKMANAGER")" >> "$GITHUB_PATH"
-          echo "$ANDROID_HOME/platform-tools" >> "$GITHUB_PATH"
 
-      - name: Accept licenses and install Android dependencies
+          echo "Using source archive: $SOURCE_ZIP"
+          PROJECT_DIR="$RUNNER_TEMP/ultron-1.5.2-source"
+          rm -rf "$PROJECT_DIR"
+          mkdir -p "$PROJECT_DIR"
+          unzip -q "$SOURCE_ZIP" -d "$PROJECT_DIR"
+
+          # This archive contains the Gradle project directly at its ZIP root.
+          # Keep a fallback for a future archive that adds one enclosing folder.
+          if [[ ! -f "$PROJECT_DIR/settings.gradle.kts" ]]; then
+            mapfile -t SETTINGS_FILES < <(find "$PROJECT_DIR" -mindepth 2 -maxdepth 3 -type f -name settings.gradle.kts -print)
+            if [[ "${#SETTINGS_FILES[@]}" -ne 1 ]]; then
+              echo "Could not identify one Android project root after extraction."
+              find "$PROJECT_DIR" -maxdepth 3 -type f \( -name settings.gradle.kts -o -name app.gradle.kts \) -print
+              exit 1
+            fi
+            PROJECT_DIR="$(dirname "${SETTINGS_FILES[0]}")"
+          fi
+
+          test -f "$PROJECT_DIR/settings.gradle.kts"
+          test -f "$PROJECT_DIR/build.gradle.kts"
+          test -f "$PROJECT_DIR/app/build.gradle.kts"
+          test -f "$PROJECT_DIR/app/src/main/cpp/CMakeLists.txt"
+          echo "ULTRON_PROJECT_DIR=$PROJECT_DIR" >> "$GITHUB_ENV"
+          echo "Extracted project root: $PROJECT_DIR"
+
+      - name: Install Android SDK, NDK and CMake packages
         shell: bash
         run: |
           set -euo pipefail
-          yes | "$SDKMANAGER" --licenses >/dev/null || true
-          "$SDKMANAGER" --install \
-            "platforms;android-35" \
-            "build-tools;35.0.0" \
-            "platform-tools" \
-            "ndk;27.2.12479018" \
-            "cmake;3.22.1"
 
-      - name: Setup Gradle
+          # Accept SDK licenses non-interactively before installing packages.
+          yes | sdkmanager --licenses >/dev/null 2>&1 || true
+
+          for attempt in 1 2 3; do
+            if sdkmanager --install \
+              "platforms;android-35" \
+              "build-tools;35.0.0" \
+              "platform-tools" \
+              "ndk;27.2.12479018" \
+              "cmake;3.22.1"; then
+              echo "Android SDK packages installed."
+              exit 0
+            fi
+
+            if [[ "$attempt" -lt 3 ]]; then
+              echo "SDK package installation failed; retrying in $((attempt * 20)) seconds."
+              sleep $((attempt * 20))
+            fi
+          done
+
+          echo "Android SDK package installation failed after 3 attempts."
+          exit 1
+
+      - name: Set up Gradle 8.9
         uses: gradle/actions/setup-gradle@v4
         with:
-          gradle-version: "8.9"
+          gradle-version: '8.9'
 
-      - name: Extract ULTRON source ZIP
+      - name: Verify extracted ULTRON project configuration
         shell: bash
         run: |
           set -euo pipefail
-          unzip -q ULTRON-1.4.0-FINAL-SOURCE.zip
-          test -f ultron_final_work/app/build.gradle.kts
-          test -f ultron_final_work/settings.gradle.kts
+          cd "$ULTRON_PROJECT_DIR"
 
-      - name: Run unit tests
-        working-directory: ultron_final_work
-        run: gradle --no-daemon :app:testDebugUnitTest
+          grep -Fq 'versionName = "1.5.2"' app/build.gradle.kts
+          grep -Fq 'compileSdk = 35' app/build.gradle.kts
+          grep -Fq 'ndkVersion = "27.2.12479018"' app/build.gradle.kts
+          grep -Fq 'version "8.7.3"' build.gradle.kts
+          grep -Fq 'version "2.0.21"' build.gradle.kts
 
-      - name: Build ULTRON debug APK
-        working-directory: ultron_final_work
-        run: gradle --no-daemon :app:assembleDebug
+          java -version
+          gradle --version
+          echo "ULTRON 1.5.2 Gradle configuration verified."
 
-      - name: Upload APK
+      - name: Run JVM unit tests (retry transient repository failures)
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd "$ULTRON_PROJECT_DIR"
+
+          for attempt in 1 2 3; do
+            if gradle --no-daemon --stacktrace --max-workers=2 :app:testDebugUnitTest; then
+              echo "Unit tests passed."
+              exit 0
+            fi
+            if [[ "$attempt" -lt 3 ]]; then
+              echo "Unit tests failed; retrying in $((attempt * 30)) seconds."
+              sleep $((attempt * 30))
+            fi
+          done
+
+          echo "Unit tests failed after 3 attempts."
+          exit 1
+
+      - name: Build ULTRON debug APK (retry transient repository failures)
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd "$ULTRON_PROJECT_DIR"
+
+          for attempt in 1 2 3; do
+            if gradle --no-daemon --stacktrace --max-workers=2 :app:assembleDebug; then
+              echo "APK assembly succeeded."
+              exit 0
+            fi
+            if [[ "$attempt" -lt 3 ]]; then
+              echo "APK build failed; retrying in $((attempt * 30)) seconds."
+              sleep $((attempt * 30))
+            fi
+          done
+
+          echo "APK build failed after 3 attempts."
+          exit 1
+
+      - name: Verify APK and generate SHA-256 checksum
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd "$ULTRON_PROJECT_DIR"
+
+          APK="app/build/outputs/apk/debug/app-debug.apk"
+          test -s "$APK"
+          mkdir -p "$RUNNER_TEMP/ultron-build-output"
+          cp "$APK" "$RUNNER_TEMP/ultron-build-output/ULTRON-1.5.2-debug.apk"
+          cd "$RUNNER_TEMP/ultron-build-output"
+          sha256sum ULTRON-1.5.2-debug.apk | tee ULTRON-1.5.2-debug.apk.sha256
+          ls -lh
+
+      - name: Upload unit-test reports
+        if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: ULTRON-APK
-          path: ultron_final_work/app/build/outputs/apk/debug/app-debug.apk
-          if-no-files-found: error
+          name: ULTRON-1.5.2-unit-test-reports
+          path: ${{ runner.temp }}/ultron-1.5.2-source/app/build/reports/tests/testDebugUnitTest/
+          if-no-files-found: ignore
           retention-days: 14
+
+      - name: Upload ULTRON 1.5.2 debug APK and checksum
+        if: success()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ULTRON-1.5.2-debug-apk
+          path: |
+            ${{ runner.temp }}/ultron-build-output/ULTRON-1.5.2-debug.apk
+            ${{ runner.temp }}/ultron-build-output/ULTRON-1.5.2-debug.apk.sha256
+          if-no-files-found: error
+          retention-days: 30
